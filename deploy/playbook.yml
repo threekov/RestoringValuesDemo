@@ -1,0 +1,21 @@
+- hosts: knn_servers
+  become: yes
+  
+  tasks:
+    - name: Install Docker
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+        state: present
+    
+    - name: Copy project files
+      copy:
+        src: ../
+        dest: /opt/knn-service
+    
+    - name: Run Docker
+      shell: |
+        cd /opt/knn-service
+        docker build -t knn-service .
+        docker run -d -p 8000:8000 --name knn-service knn-service
