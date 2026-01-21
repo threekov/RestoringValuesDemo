@@ -17,7 +17,6 @@ async def home():
     <head>
         <script>
             function resetForm() {
-                // Ждем 1 секунду и сбрасываем форму
                 setTimeout(() => {
                     document.getElementById('submitBtn').disabled = false;
                     document.getElementById('submitBtn').innerText = 'Impute';
@@ -30,7 +29,7 @@ async def home():
         <h1>KNN Imputation Service</h1>
         <form action="/impute" method="post" enctype="multipart/form-data" 
               onsubmit="document.getElementById('submitBtn').disabled=true; document.getElementById('submitBtn').innerText='Processing...';"
-              target="_blank"> <!-- ОТКРЫВАЕМ В НОВОЙ ВКЛАДКЕ! -->
+              target="_blank">
             
             <input type="file" name="file" id="fileInput" accept=".csv" required><br><br>
             <label>k: <input type="number" name="k" value="3" min="1"></label><br><br>
@@ -46,10 +45,8 @@ async def home():
 @app.post("/impute")
 async def impute_csv(file: UploadFile = File(...), k: int = Form(3)):
     try:
-        # Read file
         contents = await file.read()
         
-        # Try to parse
         try:
             df = pd.read_csv(io.BytesIO(contents), index_col=0, parse_dates=True)
         except:
@@ -57,10 +54,8 @@ async def impute_csv(file: UploadFile = File(...), k: int = Form(3)):
         
         print(f"Processing: {file.filename}, shape: {df.shape}, k={k}")
         
-        # Impute
         df_imputed = imputer.impute_csv(df, k=k)
         
-        # Return as CSV
         output = io.StringIO()
         df_imputed.to_csv(output, index=True)
         output.seek(0)
