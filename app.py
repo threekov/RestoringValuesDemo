@@ -9,6 +9,7 @@ import os
 import logging
 import json
 import time
+import traceback
 
 # Настройка логирования в JSON формате
 logger = logging.getLogger("knn_api")
@@ -70,10 +71,13 @@ async def log_requests(request: Request, call_next):
 # Добавляем core в путь для импорта
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from core.imputer_service import KNNImputationService
-
-# Создаем экземпляр сервиса
-imputer = KNNImputationService(batch_size=10, k=3)
+try:
+    from core.imputer_service import KNNImputationService
+    imputer = KNNImputationService(batch_size=10, k=3)
+    logger.info("service_initialized", extra={"status": "success"})
+except Exception as e:
+    logger.error("service_initialization_failed", extra={"error": str(e)})
+    raise
 
 # ------------------- ENDPOINTS -------------------
 
@@ -195,14 +199,6 @@ async def home(request: Request):
                     <li>FastAPI + Python 3.11 для веб-интерфейса</li>
                     <li>JSON логирование для мониторинга</li>
                 </ul>
-                
-                <h3>Доступные методы:</h3>
-                <ul>
-                    <li><code>GET /</code> - Эта страница</li>
-                    <li><code>POST /impute</code> - Импутация CSV файла</li>
-                    <li><code>GET /health</code> - Проверка работоспособности</li>
-                    <li><code>GET /metrics</code> - Метрики сервиса</li>
-                </ul>
             </div>
         </div>
         
@@ -231,15 +227,14 @@ async def impute_csv(
     """
     logger.info("impute_endpoint_called", extra={
         "endpoint": "/impute",
-        "filename": file.filename,
-        "file_size": file.size if hasattr(file, 'size') else "unknown",
+        "uploaded_filename": file.filename,  # <-- ИСПРАВЛЕНО
         "k_value": k,
         "client": request.client.host if request.client else "unknown"
     })
     
     if not file.filename.lower().endswith('.csv'):
         logger.warning("invalid_file_extension", extra={
-            "filename": file.filename,
+            "uploaded_filename": file.filename,  # <-- ИСПРАВЛЕНО
             "expected_extension": ".csv"
         })
         return {"error": "Только CSV файлы поддерживаются"}
@@ -252,7 +247,7 @@ async def impute_csv(
         file_size_kb = len(contents) / 1024
         
         logger.info("file_received", extra={
-            "filename": file.filename,
+            "uploaded_filename": file.filename,  # <-- ИСПРАВЛЕНО
             "size_kb": round(file_size_kb, 2),
             "k": k
         })
@@ -280,21 +275,23 @@ async def impute_csv(
                 
         if df_nans is None:
             logger.error("file_read_all_encodings_failed", extra={
-                "filename": file.filename,
+                "uploaded_filename": file.filename,  # <-- ИСПРАВЛЕНО
                 "tried_encodings": encodings
             })
             return {"error": "Не удалось прочитать CSV файл. Проверьте кодировку и формат."}
         
         # Логируем информацию о данных
         missing_values = df_nans.isna().sum().sum()
-        missing_percentage = (missing_values / (df_nans.shape[0] * df_nans.shape[1])) * 100
+        total_cells = df_nans.shape[0] * df_nans.shape[1]
+        missing_percentage = (missing_values / total_cells * 100) if total_cells > 0 else 0
         
         logger.info("data_analysis", extra={
             "rows": df_nans.shape[0],
             "columns": df_nans.shape[1],
             "missing_values": int(missing_values),
             "missing_percentage": round(missing_percentage, 2),
-            "columns_list": list(df_nans.columns)
+            "columns_list": list(df_nans.columns),
+            "dtypes": str(df_nans.dtypes.to_dict())
         })
         
         # Импутация пропусков
@@ -345,11 +342,13 @@ async def impute_csv(
         )
         
     except Exception as e:
+        error_traceback = traceback.format_exc()
         logger.error("imputation_error", extra={
             "error": str(e),
             "error_type": type(e).__name__,
-            "filename": file.filename
-        }, exc_info=True)
+            "uploaded_filename": file.filename,  # <-- ИСПРАВЛЕНО
+            "traceback": error_traceback
+        })
         return {"error": f"Ошибка обработки: {str(e)}"}
 
 @app.get("/health")
@@ -368,32 +367,32 @@ async def health_check():
 @app.get("/metrics")
 async def get_metrics():
     """Метрики сервиса (заглушка для демонстрации)"""
-    import psutil
-    import platform
-    
-    logger.info("metrics_endpoint_called")
-    
-    # Собираем системные метрики
-    cpu_percent = psutil.cpu_percent(interval=0.1)
-    memory = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    
-    return {
-        "system": {
-            "cpu_percent": cpu_percent,
-            "memory_percent": memory.percent,
-            "memory_available_gb": round(memory.available / (1024**3), 2),
-            "disk_percent": disk.percent,
-            "disk_free_gb": round(disk.free / (1024**3), 2),
-            "python_version": platform.python_version(),
-            "platform": platform.platform()
-        },
-        "service": {
-            "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "uptime_seconds": round(time.time() - psutil.boot_time(), 0),
-            "endpoints_available": ["/", "/impute", "/health", "/metrics"]
+    try:
+        import psutil
+        import platform
+        
+        logger.info("metrics_endpoint_called")
+        
+        # Собираем системные метрики
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+        
+        return {
+            "system": {
+                "cpu_percent": cpu_percent,
+                "memory_percent": memory.percent,
+                "memory_available_gb": round(memory.available / (1024**3), 2),
+                "python_version": platform.python_version(),
+                "platform": platform.platform()
+            },
+            "service": {
+                "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "uptime_seconds": round(time.time() - psutil.boot_time(), 0),
+                "endpoints_available": ["/", "/impute", "/health", "/metrics"]
+            }
         }
-    }
+    except ImportError:
+        return {"error": "psutil не установлен", "install": "pip install psutil"}
 
 @app.get("/test-data")
 async def test_data():
@@ -444,5 +443,5 @@ if __name__ == "__main__":
         app, 
         host="0.0.0.0", 
         port=8000,
-        log_config=None  # Используем наше собственное логирование
+        log_config=None
     )
