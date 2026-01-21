@@ -14,13 +14,27 @@ imputer = KNNImputationService()
 async def home():
     return HTMLResponse("""
     <html>
+    <head>
+        <script>
+            function resetForm() {
+                // Ждем 1 секунду и сбрасываем форму
+                setTimeout(() => {
+                    document.getElementById('submitBtn').disabled = false;
+                    document.getElementById('submitBtn').innerText = 'Impute';
+                    document.getElementById('fileInput').value = '';
+                }, 1000);
+            }
+        </script>
+    </head>
     <body style="font-family: Arial; margin: 40px;">
         <h1>KNN Imputation Service</h1>
         <form action="/impute" method="post" enctype="multipart/form-data" 
-              onsubmit="document.getElementById('submitBtn').disabled=true; document.getElementById('submitBtn').innerText='Processing...';">
-            <input type="file" name="file" accept=".csv" required><br><br>
+              onsubmit="document.getElementById('submitBtn').disabled=true; document.getElementById('submitBtn').innerText='Processing...';"
+              target="_blank"> <!-- ОТКРЫВАЕМ В НОВОЙ ВКЛАДКЕ! -->
+            
+            <input type="file" name="file" id="fileInput" accept=".csv" required><br><br>
             <label>k: <input type="number" name="k" value="3" min="1"></label><br><br>
-            <button type="submit" id="submitBtn">Impute</button>
+            <button type="submit" id="submitBtn" onclick="setTimeout(resetForm, 100)">Impute</button>
         </form>
         <p style="margin-top: 30px; color: #666;">
             CSV format: first column = time, other columns = numeric data with NaN
