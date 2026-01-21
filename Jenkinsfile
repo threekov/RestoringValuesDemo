@@ -7,30 +7,27 @@ pipeline {
     }
 
     stages {
-        // 1. Получение кода
         stage('Checkout') {
             steps {
                 checkout scm
             }
         }
 
-        // 2. Локальная сборка и тест
         stage('Build & Test') {
             steps {
                 sh '''
                     echo "==> Установка зависимостей"
-                    pip install -r requirements.txt
+                    pip3 install --user -r requirements.txt
                     
                     echo "==> Проверка импорта модели"
-                    python -c "from core.imputer_service import KNNImputationService; print('Модель загружается')"
+                    python3 -c "from core.imputer_service import KNNImputationService; print('Модель загружается')"
                     
                     echo "==> Запуск локального теста"
-                    python -m pytest tests/ -v || echo "Тесты не найдены, продолжаем..."
+                    python3 -m pytest tests/ -v || echo "Тесты не найдены, продолжаем..."
                 '''
             }
         }
 
-        // 3. Создание инфраструктуры в OpenStack
         stage('Terraform: Create VM') {
             steps {
                 dir('terraform') {
@@ -50,11 +47,9 @@ pipeline {
             }
         }
 
-        // 4. Ожидание доступности VM
         stage('Wait for VM SSH') {
             steps {
                 script {
-                    // Получаем IP созданной VM
                     vmIp = sh(
                         script: "cd terraform && terraform output -raw vm_ip",
                         returnStdout: true
@@ -79,7 +74,6 @@ pipeline {
             }
         }
 
-        // 5. Настройка и деплой через Ansible
         stage('Ansible: Deploy') {
             steps {
                 sh """
@@ -96,7 +90,6 @@ EOF
             }
         }
 
-        // 6. Финальная проверка
         stage('Verify Deployment') {
             steps {
                 sh """
