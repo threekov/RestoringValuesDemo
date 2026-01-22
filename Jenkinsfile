@@ -1,5 +1,5 @@
 pipeline {
-    agent any
+    agent any  // или agent { label 'threekov-node' } если хотите на вашей ноде
 
     environment {
         SSH_KEY_PATH              = "/home/ubuntu/.ssh/id_rsa"
@@ -28,20 +28,51 @@ pipeline {
             }
         }
 
-        stage('Terraform: Create VM') {
+        stage('Terraform: provision infra') {
             steps {
                 dir('terraform') {
                     sh '''
-                        echo "==> Инициализация Terraform"
-                        terraform init
+                        set -e
+                        echo "==> Загрузка переменных OpenStack"
                         
-                        echo "==> Создание VM в OpenStack"
-                        terraform apply -auto-approve \
-                            -var="auth_url=$OS_AUTH_URL" \
-                            -var="tenant_name=$OS_TENANT_NAME" \
-                            -var="user_name=$OS_USERNAME" \
-                            -var="password=$OS_PASSWORD" \
-                            -var="public_ssh_key=$(cat $SSH_KEY_PATH.pub)"
+                        if [ -f "/home/ubuntu/openrc-jenkins.sh" ]; then
+                            . /home/ubuntu/openrc-jenkins.sh
+                        elif [ -f "/home/ubuntu/openrc.sh" ]; then
+                            . /home/ubuntu/openrc.sh
+                        else
+                            echo "ERROR: OpenStack credentials file not found!"
+                            echo "Create /home/ubuntu/openrc-jenkins.sh with:"
+                            echo "export OS_AUTH_URL=..."
+                            echo "export OS_USERNAME=..."
+                            echo "export OS_PASSWORD=..."
+                            echo "export OS_PROJECT_NAME=..."
+                            exit 1
+                        fi
+                        
+                        echo "==> Проверка ключа"
+                        openstack keypair delete threekov 2>/dev/null || true
+                        
+                        echo "==> Генерация terraform.tfvars"
+                        cat > terraform.tfvars <<EOF
+auth_url      = "${OS_AUTH_URL}"
+tenant_name   = "${OS_PROJECT_NAME}"
+user_name     = "${OS_USERNAME}"
+password      = "${OS_PASSWORD}"
+region        = "${OS_REGION_NAME:-RegionOne}"
+
+image_name    = "ununtu-22.04"  
+flavor_name   = "m1.medium"
+network_name  = "sutdents-net"
+
+public_ssh_key = "$(cat /home/ubuntu/.ssh/id_rsa.pub)"
+environment   = "jenkins"
+EOF
+
+                        echo "==> Terraform init"
+                        terraform init -input=false
+
+                        echo "==> Terraform apply"
+                        terraform apply -auto-approve -input=false
                     '''
                 }
             }
@@ -50,53 +81,79 @@ pipeline {
         stage('Wait for VM SSH') {
             steps {
                 script {
-                    vmIp = sh(
+                    def vmIp = sh(
                         script: "cd terraform && terraform output -raw vm_ip",
                         returnStdout: true
                     ).trim()
-                    
+
                     env.VM_IP = vmIp
                     echo "Ожидание SSH на ${vmIp}"
-                    
+
                     sh """
+                        set -e
                         for i in \$(seq 1 30); do
-                            echo "Проверка SSH (попытка \$i)..."
+                            echo "==> Checking SSH (${vmIp}) attempt \$i"
                             if nc -z -w 5 ${vmIp} 22; then
-                                echo "SSH доступен!"
+                                echo "==> SSH is UP!"
                                 exit 0
                             fi
+                            echo "==> SSH not ready, sleep 10s"
                             sleep 10
                         done
-                        echo "SSH не стал доступен"
+                        echo "ERROR: SSH did not start in time"
                         exit 1
                     """
                 }
             }
         }
 
-        stage('Ansible: Deploy') {
+        stage('Ansible: deploy to VM') {
             steps {
-                sh """
-                    echo "==> Настройка Ansible inventory"
-                    cat > ansible/inventory.ini <<EOF
+                script {
+                    echo "VM IP from Terraform: ${VM_IP}"
+
+                    sh """
+                        set -e
+
+                        # Удаляем старый host key
+                        mkdir -p ~/.ssh
+                        ssh-keygen -R ${VM_IP} 2>/dev/null || true
+
+                        cd ansible
+
+                        echo "==> Generate inventory.ini"
+                        cat > inventory.ini <<EOF
 [knn_servers]
 ${VM_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${SSH_KEY_PATH}
 EOF
 
-                    echo "==> Запуск Ansible"
-                    cd ansible
-                    ansible-playbook -i inventory.ini playbook.yml
-                """
+                        echo "==> Run ansible-playbook"
+                        ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory.ini playbook.yml
+                    """
+                }
             }
         }
 
         stage('Verify Deployment') {
             steps {
                 sh """
+                    set -e
                     echo "==> Проверка работоспособности сервиса"
                     sleep 15
-                    curl -f http://${VM_IP}:8000/health
-                    echo "KNN Imputation Service запущен на http://${VM_IP}:8000"
+                    
+                    # Несколько попыток
+                    for i in \$(seq 1 5); do
+                        echo "==> Health check attempt \$i"
+                        if curl -f http://${VM_IP}:8000/health 2>/dev/null; then
+                            echo "==> Service is UP!"
+                            echo "KNN Imputation Service: http://${VM_IP}:8000"
+                            exit 0
+                        fi
+                        sleep 10
+                    done
+                    
+                    echo "ERROR: Service did not start properly"
+                    exit 1
                 """
             }
         }
@@ -104,11 +161,11 @@ EOF
 
     post {
         success {
-            echo "Пайплайн успешно завершен!"
-            echo "Сервис доступен по адресу: http://${VM_IP}:8000"
+            echo "Pipeline SUCCESS: Full build → infra → deploy completed."
+            echo "Service: http://${VM_IP}:8000"
         }
         failure {
-            echo "Пайплайн завершился с ошибкой"
+            echo "Pipeline FAILED."
         }
     }
 }
