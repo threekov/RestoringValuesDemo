@@ -54,8 +54,20 @@
         src: ../
         dest: /opt/knn-service
 
-    - name: Build and run Docker container
+    - name: Stop and remove existing container
+      shell: |
+        docker stop knn-service 2>/dev/null || true
+        docker rm knn-service 2>/dev/null || true
+
+    - name: Remove existing image
+      shell: |
+        docker rmi knn-service 2>/dev/null || true
+
+    - name: Build Docker image
       shell: |
         cd /opt/knn-service
         docker build -t knn-service .
+
+    - name: Run Docker container
+      shell: |
         docker run -d -p 8000:8000 --name knn-service knn-service
