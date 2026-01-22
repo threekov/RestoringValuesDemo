@@ -65,7 +65,7 @@ flavor_name   = "m1.small"
 network_name  = "sutdents-net"
 
 public_ssh_key = "$(cat /home/ubuntu/.ssh/id_rsa.pub)"
-environment   = "jenkins"
+environment   = "threekov"
 EOF
 
                         echo "==> Terraform init"
