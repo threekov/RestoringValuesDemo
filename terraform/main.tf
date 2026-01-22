@@ -22,7 +22,7 @@ resource "openstack_compute_instance_v2" "knn_vm" {
   name        = "knn-vm-${var.environment}"
   image_name  = var.image_name
   flavor_name = var.flavor_name
-  key_pair    = openstack_compute_keypair_v2.knn_key.name
+  key_pair    = openstack_compute_keypair_v2.threekov.name
 
   network {
     name = var.network_name
