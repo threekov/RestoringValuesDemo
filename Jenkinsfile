@@ -1,5 +1,5 @@
 pipeline {
-    agent any  // или agent { label 'threekov-node' } если хотите на вашей ноде
+    agent any
 
     environment {
         SSH_KEY_PATH              = "/home/ubuntu/.ssh/id_rsa"
