@@ -19,7 +19,7 @@ resource "openstack_compute_keypair_v2" "threekov" {
 }
 
 resource "openstack_compute_instance_v2" "knn_vm" {
-  name        = "knn-vm-${var.environment}"
+  name        = "${var.environment}-knn-vm"
   image_name  = var.image_name
   flavor_name = var.flavor_name
   key_pair    = openstack_compute_keypair_v2.threekov.name
