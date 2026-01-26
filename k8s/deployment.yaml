@@ -2,21 +2,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: knn-service
+  name: knn-vm-lab7
   namespace: threekov-lab7
 spec:
   replicas: 2 
   selector:
     matchLabels:
-      app: knn-service
+      app: knn-vm-lab7
   template:
     metadata:
       labels:
-        app: knn-service
+        app: knn-vm-lab7
     spec:
       containers:
-        - name: knn-service
-          image: cr.yandex/<REGISTRY_ID>/knn-service:latest
+        - name: knn-vm-lab7
+          image: cr.yandex/<REGISTRY_ID>/knn-vm-lab7:latest
           imagePullPolicy: Always
           ports:
             - name: http
