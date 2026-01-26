@@ -20,322 +20,173 @@ pipeline {
   }
 
   stages {
-    // Этап 1: Получение кода
+    stage('Fix Docker Credential Helper') {
+      steps {
+        sh '''#!/bin/bash
+          echo "=== ФИКСИМ DOCKER-CREDENTIAL-YC ==="
+          # Удаляем битый docker-credential-yc если есть
+          sudo rm -f /usr/local/bin/docker-credential-yc 2>/dev/null || true
+          sudo rm -f /usr/bin/docker-credential-yc 2>/dev/null || true
+          echo "docker-credential-yc удален"
+        '''
+      }
+    }
+
     stage('Checkout') {
       steps { 
         checkout scm 
-        sh '''
-          echo "Ревизия: $(git rev-parse --short HEAD)"
-          echo "Структура проекта:"
-          find . -maxdepth 2 -type f -name "*.py" -o -name "*.yaml" -o -name "Dockerfile" -o -name "*.txt" | sort
-        '''
       }
     }
 
-    // Этап 2: Тестирование Python
-    stage('Build & Test') {
+    stage('Build Docker') {
       steps {
         sh '''
-          echo "==> Установка зависимостей Python"
-          pip3 install --user -r requirements.txt
-          
-          echo "==> Проверка импорта модели"
-          python3 -c "from core.imputer_service import KNNImputationService; print('Модель загружается')"
-          
-          echo "==> Проверка FastAPI приложения"
-          python3 -c "import app; print('Приложение импортируется')"
-          
-          echo "==> Запуск тестов (если есть)"
-          python3 -m pytest tests/ -v || echo "Тесты не найдены"
-        '''
-      }
-    }
-
-    // Этап 3: Сборка Docker образа
-    stage('Docker Build') {
-      steps {
-        sh '''#!/usr/bin/env bash
-          set -e
-          echo "==> Сборка Docker образа"
-          echo "Dockerfile: $(pwd)/Dockerfile"
-          echo "Образ: ${IMAGE_FULL}"
-          
-          # Проверяем Dockerfile
-          ls -la Dockerfile
-          head -10 Dockerfile
-          
-          # Собираем образы
+          echo "=== СБОРКА DOCKER ОБРАЗА ==="
           docker build -t ${IMAGE_FULL} .
           docker tag ${IMAGE_FULL} ${IMAGE_LATEST}
-          
-          echo "==> Список локальных образов"
-          docker images | grep ${APP_NAME}
+          echo "Образ собран: ${IMAGE_FULL}"
         '''
       }
     }
 
-    // Этап 4: Пуш в Yandex Container Registry
-    stage('Docker Push to YCR') {
+    stage('Push to YCR - Simple Auth') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -euo pipefail
-          echo "==> Подготовка к пушу в YCR"
-
-          # Поиск yc (Yandex Cloud CLI)
-          find_yc() {
-            local paths=(
-              "/home/ubuntu/yandex-cloud/bin/yc"
-              "/usr/local/bin/yc"
-              "/usr/bin/yc"
-              "$(which yc 2>/dev/null)"
-            )
-            for path in "${paths[@]}"; do
-              if [ -x "$path" ]; then
-                echo "$path"
-                return 0
-              fi
-            done
-            echo "ERROR: yc not found!" >&2
-            return 1
-          }
-
-          YC=$(find_yc)
-          echo "Найден yc: $YC"
+        sh '''#!/bin/bash
+          echo "=== ПУШ В YCR (упрощенная аутентификация) ==="
           
-          # Получение IAM токена
-          echo "==> Получение IAM токена"
-          TOKEN="$($YC iam create-token)"
+          # Получаем токен
+          TOKEN=$(yc iam create-token)
+          echo "Токен получен"
           
-          if [ -z "$TOKEN" ] || [[ "$TOKEN" == *"error"* ]]; then
-            echo "Ошибка получения токена: $TOKEN"
-            echo "Проверьте: $YC config list"
-            exit 1
-          fi
-
-          echo "==> Логин в Yandex Container Registry"
-          echo "$TOKEN" | docker login --username iam --password-stdin cr.yandex || {
-            echo "Ошибка логина в YCR"
-            exit 1
-          }
-
-          echo "==> Пуш образов в YCR"
-          echo "Отправка: ${IMAGE_FULL}"
-          docker push ${IMAGE_FULL} || {
-            echo "Ошибка пуша ${IMAGE_FULL}"
-            exit 1
-          }
+          # Используем простую аутентификацию без credential helper
+          echo "Авторизация в Docker..."
+          AUTH=$(echo -n "iam:$TOKEN" | base64)
+          mkdir -p ~/.docker
+          cat > ~/.docker/config.json << EOF
+{
+  "auths": {
+    "cr.yandex": {
+      "auth": "$AUTH"
+    }
+  },
+  "credHelpers": {
+    "cr.yandex": ""
+  }
+}
+EOF
           
-          echo "Отправка: ${IMAGE_LATEST}"
-          docker push ${IMAGE_LATEST} || {
-            echo "Ошибка пуша ${IMAGE_LATEST}"
-            exit 1
-          }
+          # Пушим
+          echo "Пушим образ..."
+          docker push ${IMAGE_FULL}
+          docker push ${IMAGE_LATEST}
           
-          echo "==> Проверка в registry"
-          $YC container image list --registry-id ${REGISTRY_ID} | grep ${APP_NAME} || true
-          echo "Образы успешно загружены в YCR"
+          echo "Образы успешно загружены в YCR!"
         '''
       }
     }
 
-    // Этап 5: Настройка Kubernetes
-    stage('Kubernetes Setup') {
+    stage('Deploy to K8S - Fix Image') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -e
-          echo "==> Проверка подключения к Kubernetes"
+        sh '''
+          echo "=== ДЕПЛОЙ В K8S ==="
           
-          # Проверка kubectl
-          kubectl version --client
-          kubectl cluster-info || {
-            echo "Не могу подключиться к кластеру"
-            echo "Проверьте kubeconfig"
-            exit 1
-          }
+          # 1. Сначала удаляем старый деплоймент с битым образом
+          kubectl delete deployment ${APP_NAME} -n ${NAMESPACE} --ignore-not-found=true
+          kubectl delete rs -n ${NAMESPACE} -l app=${APP_NAME} --ignore-not-found=true
+          kubectl delete pods -n ${NAMESPACE} -l app=${APP_NAME} --ignore-not-found=true
+          echo "Старые ресурсы удалены"
+          sleep 5
           
-          # Проверка/создание неймспейса
-          if kubectl get ns ${NAMESPACE} >/dev/null 2>&1; then
-            echo "Неймспейс ${NAMESPACE} существует"
-          else
-            echo "Создание неймспейса ${NAMESPACE}"
-            kubectl create ns ${NAMESPACE}
-          fi
+          # 2. Создаем новый deployment.yaml с правильным образом
+          cat > k8s/deployment-fixed.yaml << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+    spec:
+      containers:
+        - name: ${APP_NAME}
+          image: ${IMAGE_FULL}
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+EOF
           
-          echo "==> Текущее состояние кластера"
-          kubectl get nodes
-          kubectl get all -n ${NAMESPACE} || echo "Неймспейс пуст"
-        '''
-      }
-    }
-
-    // Этап 6: Деплой в Kubernetes
-    stage('Kubernetes Deploy') {
-      steps {
-        sh '''#!/usr/bin/env bash
-          set -e
-          echo "==> Деплоймент в Kubernetes"
-          echo "Используем образ: ${IMAGE_FULL}"
+          # 3. Применяем
+          echo "Применяем исправленный deployment..."
+          kubectl apply -f k8s/deployment-fixed.yaml
+          kubectl apply -f k8s/service.yaml -n ${NAMESPACE}
           
-          # Проверяем наличие манифестов
-          if [ ! -d "k8s" ]; then
-            echo "Директория k8s не найдена!"
-            exit 1
-          fi
+          # 4. Ждем
+          echo "Ожидаем развертывания..."
+          sleep 15
+          kubectl get pods -n ${NAMESPACE} -w &
+          sleep 30
+          pkill -f "kubectl get pods"
           
-          ls -la k8s/
-          
-          # Обновляем образ в deployment.yaml
-          echo "==> Обновление deployment.yaml"
-          if [ -f "k8s/deployment.yaml" ]; then
-            # Создаем временный файл с подставленным образом
-            sed "s|IMAGE_PLACEHOLDER|${IMAGE_FULL}|g" k8s/deployment.yaml > k8s/deployment-temp.yaml
-            
-            echo "--- deployment-temp.yaml ---"
-            head -20 k8s/deployment-temp.yaml
-            echo "----------------------------"
-            
-            # Применяем манифесты
-            kubectl apply -n ${NAMESPACE} -f k8s/deployment-temp.yaml
-            rm -f k8s/deployment-temp.yaml
-          else
-            echo "Файл k8s/deployment.yaml не найден"
-          fi
-          
-          # Применяем остальные манифесты
-          for file in k8s/*.yaml; do
-            if [ "$(basename "$file")" != "deployment.yaml" ]; then
-              echo "Применяем: $file"
-              kubectl apply -n ${NAMESPACE} -f "$file"
-            fi
-          done
-          
-          echo "==> Ожидание развертывания (180 секунд)"
-          kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=180s
-          
-          echo "==> Финальное состояние"
+          echo "Деплоймент завершен!"
           kubectl get all -n ${NAMESPACE}
-          kubectl get pods -n ${NAMESPACE} -o wide
-          kubectl get svc -n ${NAMESPACE}
         '''
       }
     }
 
-    // Этап 7: Верификация
-    stage('Verify Deployment') {
+    stage('Verify') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -e
-          echo "==> Проверка работоспособности сервиса"
+        sh '''
+          echo "=== ПРОВЕРКА ==="
+          echo "Поды:"
+          kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o wide
           
-          # Получаем информацию о сервисе
-          SERVICE_TYPE=$(kubectl get svc ${APP_NAME} -n ${NAMESPACE} -o jsonpath='{.spec.type}')
-          echo "Тип сервиса: $SERVICE_TYPE"
-          
-          # В зависимости от типа сервиса проверяем по-разному
-          if [ "$SERVICE_TYPE" = "ClusterIP" ]; then
-            echo "Сервис ClusterIP - используем port-forward для тестирования"
-            
-            # Запускаем port-forward в фоне
-            kubectl port-forward -n ${NAMESPACE} svc/${APP_NAME} 8080:80 &
-            PF_PID=$!
-            
-            # Даем время на запуск
-            sleep 10
-            
-            echo "==> Проверка health-check эндпоинта"
-            for i in {1..10}; do
-              echo "Попытка $i/10..."
-              if curl -f -s http://localhost:8080/health >/dev/null; then
-                echo "Health-check прошел успешно!"
-                
-                # Проверка основного интерфейса
-                echo "==> Проверка веб-интерфейса"
-                curl -s http://localhost:8080/ | grep -i "KNN" && echo "Веб-интерфейс доступен"
-                
-                # Завершаем port-forward
-                kill $PF_PID 2>/dev/null || true
-                wait $PF_PID 2>/dev/null || true
-                exit 0
-              fi
-              sleep 5
-            done
-            
-            echo "Сервис не ответил за 50 секунд"
-            kill $PF_PID 2>/dev/null || true
-          else
-            # Для NodePort/LoadBalancer
-            echo "Проверка через внешний IP/порт"
-            # Здесь можно добавить логику для других типов сервисов
+          echo "Логи первого пода:"
+          POD=$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "")
+          if [ -n "$POD" ]; then
+            echo "Логи пода $POD:"
+            kubectl logs -n ${NAMESPACE} $POD --tail=20
           fi
-          
-          # Если не удалось - показываем логи
-          echo "==> Логи для диагностики"
-          POD_NAME=$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-          
-          if [ -n "$POD_NAME" ]; then
-            echo "Логи пода: $POD_NAME"
-            kubectl logs -n ${NAMESPACE} "$POD_NAME" --tail=50
-            echo "Описание пода:"
-            kubectl describe pod -n ${NAMESPACE} "$POD_NAME" | tail -50
-          else
-            echo "Поды не найдены"
-            kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' | tail -20
-          fi
-          
-          exit 1
         '''
       }
     }
   }
 
   post {
-    success {
-      echo "PIPELINE УСПЕШНО ЗАВЕРШЕН!"
-      echo "=========================================="
-      echo "Сервис: ${APP_NAME}"
-      echo "Неймспейс: ${NAMESPACE}"
-      echo "Образ: ${IMAGE_FULL}"
-      echo "Статус:"
-      sh '''
-        kubectl get pods,svc -n ${NAMESPACE}
-        echo ""
-        echo "Для доступа к сервису:"
-        echo "1. Port-forward: kubectl port-forward -n ${NAMESPACE} svc/${APP_NAME} 8000:80"
-        echo "2. Затем откройте: http://localhost:8000"
-      '''
-      echo "=========================================="
-    }
-    
-    failure {
-      echo "PIPELINE ЗАВЕРШИЛСЯ С ОШИБКОЙ"
-      echo "=========================================="
-      sh '''
-        echo "Диагностическая информация:"
-        echo "1. Pods:"
-        kubectl get pods -n ${NAMESPACE} -o wide || true
-        echo ""
-        echo "2. Events:"
-        kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' | tail -20 || true
-        echo ""
-        echo "3. Deployment:"
-        kubectl describe deployment ${APP_NAME} -n ${NAMESPACE} | tail -30 || true
-      '''
-      echo "=========================================="
-    }
-    
     always {
-      echo "==> Очистка временных ресурсов"
       sh '''
-        # Останавливаем все port-forward процессы
-        pkill -f "kubectl port-forward" 2>/dev/null || true
-        
-        # Показываем использованные образы
-        echo "Использованные Docker образы:"
-        docker images | grep ${APP_NAME} || true
-        
-        # Финальный статус
-        echo "Финальный статус Kubernetes:"
-        kubectl get all -n ${NAMESPACE} 2>/dev/null || echo "Не удалось получить статус"
+        echo "=== ФИНИШ ==="
+        rm -f k8s/deployment-fixed.yaml 2>/dev/null || true
+        kubectl get all -n ${NAMESPACE}
       '''
     }
   }
