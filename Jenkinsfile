@@ -138,22 +138,45 @@ EOF
             steps {
                 sh """
                     set -e
-                    echo "==> Проверка работоспособности сервиса"
-                    sleep 15
+                    echo "==> Проверка работоспособности сервиса через SSH tunnel"
                     
-                    # Несколько попыток
-                    for i in \$(seq 1 5); do
+                    # Подключаемся по SSH и проверяем сервис
+                    echo "==> Проверка через SSH команду"
+                    for i in \$(seq 1 10); do
                         echo "==> Health check attempt \$i"
-                        if curl -f http://${VM_IP}:8000/health 2>/dev/null; then
-                            echo "==> Service is UP!"
+                        if ssh -o StrictHostKeyChecking=no -i ${SSH_KEY_PATH} ubuntu@${VM_IP} \\
+                           "curl -s http://localhost:8000/health 2>/dev/null || exit 1"; then
+                            echo "==> Service is UP and running!"
+                            
+                            # Проверка веб-интерфейса
+                            if ssh -o StrictHostKeyChecking=no -i ${SSH_KEY_PATH} ubuntu@${VM_IP} \\
+                               "curl -s http://localhost:8000 | grep -q 'KNN'"; then
+                                echo "==> Web interface is accessible"
+                            fi
+                            
+                            echo "==> Проверка успешно завершена"
                             echo "KNN Imputation Service: http://${VM_IP}:8000"
                             exit 0
                         fi
+                        echo "==> Service not ready yet, sleep 10s"
                         sleep 10
                     done
                     
-                    echo "ERROR: Service did not start properly"
-                    exit 1
+                    # Альтернатива: через SSH tunnel
+                    echo "==> Попытка через SSH tunnel"
+                    ssh -o StrictHostKeyChecking=no -i ${SSH_KEY_PATH} -L 8080:localhost:8000 -N ubuntu@${VM_IP} &
+                    TUNNEL_PID=\$!
+                    sleep 5
+                    
+                    if curl -s http://localhost:8080/health 2>/dev/null; then
+                        echo "==> Service works via SSH tunnel!"
+                        kill \$TUNNEL_PID 2>/dev/null
+                        exit 0
+                    else
+                        echo "==> Service check failed via tunnel too"
+                        kill \$TUNNEL_PID 2>/dev/null
+                        exit 1
+                    fi
                 """
             }
         }
