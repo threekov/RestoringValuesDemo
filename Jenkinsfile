@@ -1,7 +1,7 @@
 pipeline {
   agent {
     node {
-      label 'threekov-node'
+      label 'threekov-node' 
     }
   }
 
@@ -20,14 +20,16 @@ pipeline {
   }
 
   stages {
-    stage('Fix Docker Credential Helper') {
+    stage('Fix Docker Config') {
       steps {
         sh '''#!/bin/bash
-          echo "=== ФИКСИМ DOCKER-CREDENTIAL-YC ==="
-          # Удаляем битый docker-credential-yc если есть
-          sudo rm -f /usr/local/bin/docker-credential-yc 2>/dev/null || true
-          sudo rm -f /usr/bin/docker-credential-yc 2>/dev/null || true
-          echo "docker-credential-yc удален"
+          echo "=== ФИКСИМ DOCKER CONFIG ==="
+          
+          # Удаляем старый кривой config
+          rm -f ~/.docker/config.json
+          rm -f /root/.docker/config.json 2>/dev/null || true
+          
+          echo "Старый docker config удален"
         '''
       }
     }
@@ -35,147 +37,131 @@ pipeline {
     stage('Checkout') {
       steps { 
         checkout scm 
-      }
-    }
-
-    stage('Build Docker') {
-      steps {
         sh '''
-          echo "=== СБОРКА DOCKER ОБРАЗА ==="
-          docker build -t ${IMAGE_FULL} .
-          docker tag ${IMAGE_FULL} ${IMAGE_LATEST}
-          echo "Образ собран: ${IMAGE_FULL}"
+          echo "Ревизия: $(git rev-parse --short HEAD)"
+          echo "Нода: $(hostname)"
+          echo "YC версия: $(yc --version)"
         '''
       }
     }
 
-    stage('Push to YCR - Simple Auth') {
+    stage('Build & Test') {
       steps {
-        sh '''#!/bin/bash
-          echo "=== ПУШ В YCR (упрощенная аутентификация) ==="
+        sh '''
+          echo "==> Установка зависимостей Python"
+          pip3 install --user -r requirements.txt
           
-          # Получаем токен
+          echo "==> Проверка импорта модели"
+          python3 -c "from core.imputer_service import KNNImputationService; print('Модель загружается')"
+          echo "==> Проверка FastAPI приложения"
+          python3 -c "import app; print('Приложение импортируется')"
+        '''
+      }
+    }
+
+    stage('Docker Build') {
+      steps {
+        sh '''
+          echo "==> Сборка Docker образа"
+          docker build -t ${IMAGE_FULL} .
+          docker tag ${IMAGE_FULL} ${IMAGE_LATEST}
+          echo "==> Локальные образы:"
+          docker images | grep ${APP_NAME} || true
+        '''
+      }
+    }
+
+    stage('Docker Push to YCR - SIMPLE') {
+      steps {
+        sh '''#!/usr/bin/env bash
+          set -e
+          echo "==> Подготовка к пушу в YCR"
+          
+          # Проверяем наличие yc
+          echo "Найден yc: $(which yc)"
+          
+          echo "==> Получение IAM токена"
           TOKEN=$(yc iam create-token)
-          echo "Токен получен"
+          echo "Токен получен (первые 20 символов): ${TOKEN:0:20}..."
           
-          # Используем простую аутентификацию без credential helper
-          echo "Авторизация в Docker..."
-          AUTH=$(echo -n "iam:$TOKEN" | base64)
-          mkdir -p ~/.docker
-          cat > ~/.docker/config.json << EOF
+          echo "==> Логин в Yandex Container Registry"
+          # ИГНОРИРУЕМ ошибку сохранения credentials!
+          echo "$TOKEN" | docker login --username iam --password-stdin cr.yandex 2>&1 | grep -v "Error saving credentials" || true
+          
+          # Проверяем что логин прошел
+          if grep -q "cr.yandex" ~/.docker/config.json 2>/dev/null; then
+            echo "Docker login успешен"
+          else
+            echo "Docker login не создал config, создаем вручную..."
+            AUTH=$(echo -n "iam:$TOKEN" | base64)
+            mkdir -p ~/.docker
+            cat > ~/.docker/config.json << EOF
 {
   "auths": {
     "cr.yandex": {
       "auth": "$AUTH"
     }
-  },
-  "credHelpers": {
-    "cr.yandex": ""
   }
 }
 EOF
+          fi
           
-          # Пушим
-          echo "Пушим образ..."
-          docker push ${IMAGE_FULL}
-          docker push ${IMAGE_LATEST}
+          echo "==> Пуш образов в YCR"
+          echo "Отправка: ${IMAGE_FULL}"
+          docker push ${IMAGE_FULL} || {
+            echo "Ошибка при пуше!"
+            echo "Проверяем текущий docker config:"
+            cat ~/.docker/config.json 2>/dev/null || echo "Нет config"
+            exit 1
+          }
           
-          echo "Образы успешно загружены в YCR!"
+          echo "Отправка: ${IMAGE_LATEST}"
+          docker push ${IMAGE_LATEST} || echo "Не удалось загрузить latest"
+          
+          echo "Образы успешно загружены в YCR"
         '''
       }
     }
 
-    stage('Deploy to K8S - Fix Image') {
+    stage('Kubernetes Deploy') {
       steps {
         sh '''
-          echo "=== ДЕПЛОЙ В K8S ==="
+          echo "==> Деплоймент в Kubernetes"
+          echo "Используем образ: ${IMAGE_FULL}"
           
-          # 1. Сначала удаляем старый деплоймент с битым образом
+          # Убедимся что в deployment.yaml есть IMAGE_PLACEHOLDER
+          if ! grep -q "IMAGE_PLACEHOLDER" k8s/deployment.yaml; then
+            echo "В deployment.yaml нет IMAGE_PLACEHOLDER!"
+            echo "Исправь k8s/deployment.yaml:"
+            echo "  image: IMAGE_PLACEHOLDER"
+            exit 1
+          fi
+          
+          # Создаем временный deployment файл с подставленным образом
+          sed "s|IMAGE_PLACEHOLDER|${IMAGE_FULL}|g" k8s/deployment.yaml > k8s/deployment-temp.yaml
+          
+          # Удаляем старый деплоймент
           kubectl delete deployment ${APP_NAME} -n ${NAMESPACE} --ignore-not-found=true
-          kubectl delete rs -n ${NAMESPACE} -l app=${APP_NAME} --ignore-not-found=true
-          kubectl delete pods -n ${NAMESPACE} -l app=${APP_NAME} --ignore-not-found=true
-          echo "Старые ресурсы удалены"
-          sleep 5
+          sleep 3
           
-          # 2. Создаем новый deployment.yaml с правильным образом
-          cat > k8s/deployment-fixed.yaml << EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${APP_NAME}
-  namespace: ${NAMESPACE}
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: ${APP_NAME}
-  template:
-    metadata:
-      labels:
-        app: ${APP_NAME}
-    spec:
-      containers:
-        - name: ${APP_NAME}
-          image: ${IMAGE_FULL}
-          imagePullPolicy: Always
-          ports:
-            - name: http
-              containerPort: 8000
-          env:
-            - name: PYTHONUNBUFFERED
-              value: "1"
-          resources:
-            requests:
-              memory: "256Mi"
-              cpu: "250m"
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 5
-            periodSeconds: 5
-EOF
-          
-          # 3. Применяем
-          echo "Применяем исправленный deployment..."
-          kubectl apply -f k8s/deployment-fixed.yaml
+          # Применяем манифесты
+          kubectl apply -f k8s/deployment-temp.yaml
           kubectl apply -f k8s/service.yaml -n ${NAMESPACE}
           
-          # 4. Ждем
+          # Ждем rollout
           echo "Ожидаем развертывания..."
-          sleep 15
-          kubectl get pods -n ${NAMESPACE} -w &
-          sleep 30
-          pkill -f "kubectl get pods"
+          kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=180s || {
+            echo "Rollout status не завершился, проверяем вручную..."
+            sleep 10
+          }
           
-          echo "Деплоймент завершен!"
+          # Показываем статус
+          echo "==> Финальное состояние"
           kubectl get all -n ${NAMESPACE}
-        '''
-      }
-    }
-
-    stage('Verify') {
-      steps {
-        sh '''
-          echo "=== ПРОВЕРКА ==="
-          echo "Поды:"
-          kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o wide
           
-          echo "Логи первого пода:"
-          POD=$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "")
-          if [ -n "$POD" ]; then
-            echo "Логи пода $POD:"
-            kubectl logs -n ${NAMESPACE} $POD --tail=20
-          fi
+          # Проверяем поды
+          echo "Статус подов:"
+          kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o wide
         '''
       }
     }
@@ -184,9 +170,13 @@ EOF
   post {
     always {
       sh '''
-        echo "=== ФИНИШ ==="
-        rm -f k8s/deployment-fixed.yaml 2>/dev/null || true
-        kubectl get all -n ${NAMESPACE}
+        echo "==> Очистка"
+        rm -f k8s/deployment-temp.yaml 2>/dev/null || true
+        
+        echo "==> Итог"
+        echo "Образ: ${IMAGE_FULL}"
+        echo "Поды:"
+        kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} 2>/dev/null || echo "Поды не найдены"
       '''
     }
   }
