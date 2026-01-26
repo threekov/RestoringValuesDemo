@@ -1,7 +1,7 @@
 pipeline {
   agent {
     node {
-      label 'threekov-node' 
+      label 'threekov-node'
     }
   }
 
@@ -12,6 +12,10 @@ pipeline {
     IMAGE_TAG        = "${BUILD_NUMBER}"
     IMAGE_FULL       = "cr.yandex/${REGISTRY_ID}/${APP_NAME}:${IMAGE_TAG}"
     IMAGE_LATEST     = "cr.yandex/${REGISTRY_ID}/${APP_NAME}:latest"
+    
+    // Явно добавляем путь к yc
+    YC_PATH = "/home/ubuntu/yandex-cloud/bin"
+    PATH = "$YC_PATH:$PATH"
   }
 
   options {
@@ -20,16 +24,47 @@ pipeline {
   }
 
   stages {
-    stage('Fix Docker Config') {
+    stage('Setup Environment') {
       steps {
         sh '''#!/bin/bash
-          echo "=== ФИКСИМ DOCKER CONFIG ==="
+          echo "=== НАСТРОЙКА ОКРУЖЕНИЯ ==="
+          echo "Нода: $(hostname)"
+          echo "Пользователь: $(whoami)"
           
-          # Удаляем старый кривой config
-          rm -f ~/.docker/config.json
-          rm -f /root/.docker/config.json 2>/dev/null || true
+          # Проверяем и настраиваем PATH
+          echo "Текущий PATH: $PATH"
+          echo "Добавляем yc в PATH..."
+          export PATH="/home/ubuntu/yandex-cloud/bin:$PATH"
+          echo "Новый PATH: $PATH"
           
-          echo "Старый docker config удален"
+          # Проверяем инструменты
+          echo "Проверка инструментов:"
+          which python3 || echo "python3 не найден"
+          which docker || echo "docker не найден"
+          which kubectl || echo "kubectl не найден"
+          which yc || echo "yc не найден"
+          
+          # Если yc не найден, ищем его
+          if ! command -v yc &> /dev/null; then
+            echo "Ищем yc..."
+            if [ -f "/home/ubuntu/yandex-cloud/bin/yc" ]; then
+              echo "yc найден по пути: /home/ubuntu/yandex-cloud/bin/yc"
+              export PATH="/home/ubuntu/yandex-cloud/bin:$PATH"
+            elif [ -f "$HOME/yandex-cloud/bin/yc" ]; then
+              echo "yc найден по пути: $HOME/yandex-cloud/bin/yc"
+              export PATH="$HOME/yandex-cloud/bin:$PATH"
+            else
+              echo "yc не найден, устанавливаем..."
+              curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+              export PATH="$HOME/yandex-cloud/bin:$PATH"
+            fi
+          fi
+          
+          echo "Версия yc: $(yc --version 2>/dev/null || echo 'не найден')"
+          
+          # Фиксим docker config
+          rm -f ~/.docker/config.json 2>/dev/null || true
+          echo "✅ Окружение настроено"
         '''
       }
     }
@@ -39,129 +74,161 @@ pipeline {
         checkout scm 
         sh '''
           echo "Ревизия: $(git rev-parse --short HEAD)"
-          echo "Нода: $(hostname)"
-          echo "YC версия: $(yc --version)"
         '''
       }
     }
 
-    stage('Build & Test') {
+    stage('Build Docker') {
       steps {
         sh '''
-          echo "==> Установка зависимостей Python"
-          pip3 install --user -r requirements.txt
-          
-          echo "==> Проверка импорта модели"
-          python3 -c "from core.imputer_service import KNNImputationService; print('Модель загружается')"
-          echo "==> Проверка FastAPI приложения"
-          python3 -c "import app; print('Приложение импортируется')"
-        '''
-      }
-    }
-
-    stage('Docker Build') {
-      steps {
-        sh '''
-          echo "==> Сборка Docker образа"
+          echo "=== СБОРКА DOCKER ОБРАЗА ==="
           docker build -t ${IMAGE_FULL} .
           docker tag ${IMAGE_FULL} ${IMAGE_LATEST}
-          echo "==> Локальные образы:"
-          docker images | grep ${APP_NAME} || true
+          echo "✅ Образ собран: ${IMAGE_FULL}"
         '''
       }
     }
 
-    stage('Docker Push to YCR - SIMPLE') {
+    stage('Docker Push - Direct Method') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -e
-          echo "==> Подготовка к пушу в YCR"
+        sh '''#!/bin/bash
+          echo "=== ПУШ В YCR (прямой метод) ==="
           
-          # Проверяем наличие yc
-          echo "Найден yc: $(which yc)"
+          # Явный путь к yc
+          YC="/home/ubuntu/yandex-cloud/bin/yc"
+          echo "Используем yc: $YC"
           
-          echo "==> Получение IAM токена"
-          TOKEN=$(yc iam create-token)
-          echo "Токен получен (первые 20 символов): ${TOKEN:0:20}..."
+          if [ ! -x "$YC" ]; then
+            echo "❌ yc не найден по пути: $YC"
+            echo "Ищем в системе..."
+            YC=$(find /home -name yc -type f -executable 2>/dev/null | head -1)
+            if [ -z "$YC" ]; then
+              echo "Устанавливаем yc..."
+              curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+              YC="$HOME/yandex-cloud/bin/yc"
+            fi
+          fi
           
-          echo "==> Логин в Yandex Container Registry"
-          # ИГНОРИРУЕМ ошибку сохранения credentials!
-          echo "$TOKEN" | docker login --username iam --password-stdin cr.yandex 2>&1 | grep -v "Error saving credentials" || true
+          echo "Найден yc: $YC"
           
-          # Проверяем что логин прошел
-          if grep -q "cr.yandex" ~/.docker/config.json 2>/dev/null; then
-            echo "Docker login успешен"
-          else
-            echo "Docker login не создал config, создаем вручную..."
-            AUTH=$(echo -n "iam:$TOKEN" | base64)
-            mkdir -p ~/.docker
-            cat > ~/.docker/config.json << EOF
+          # Получаем токен
+          echo "Получаем IAM токен..."
+          TOKEN=$($YC iam create-token 2>/dev/null || echo "")
+          
+          if [ -z "$TOKEN" ]; then
+            echo "❌ Не удалось получить токен!"
+            echo "Проверь конфигурацию yc:"
+            $YC config list 2>/dev/null || echo "Не удалось получить конфигурацию"
+            exit 1
+          fi
+          
+          echo "Токен получен (длина: ${#TOKEN})"
+          
+          # Прямая аутентификация в Docker
+          echo "Аутентификация в Docker..."
+          AUTH=$(echo -n "iam:$TOKEN" | base64 -w0)
+          mkdir -p ~/.docker
+          cat > ~/.docker/config.json << EOF
 {
   "auths": {
     "cr.yandex": {
       "auth": "$AUTH"
     }
+  },
+  "credHelpers": {
+    "cr.yandex": ""
   }
 }
 EOF
+          
+          echo "Проверяем аутентификацию..."
+          if docker login cr.yandex --username iam --password-stdin <<< "$TOKEN" 2>&1 | grep -q "Login Succeeded"; then
+            echo "✅ Docker аутентификация успешна"
+          else
+            echo "⚠️ Docker login не прошел, используем ручную аутентификацию"
           fi
           
-          echo "==> Пуш образов в YCR"
-          echo "Отправка: ${IMAGE_FULL}"
-          docker push ${IMAGE_FULL} || {
-            echo "Ошибка при пуше!"
-            echo "Проверяем текущий docker config:"
+          # Пушим образ
+          echo "Пушим ${IMAGE_FULL}..."
+          if docker push ${IMAGE_FULL}; then
+            echo "✅ Образ успешно загружен"
+          else
+            echo "❌ Ошибка при пуше!"
+            echo "Проверяем docker config:"
             cat ~/.docker/config.json 2>/dev/null || echo "Нет config"
-            exit 1
-          }
+            echo "Пробуем альтернативный метод..."
+            
+            # Альтернатива: используем docker-credential-yc напрямую
+            if [ -f "/home/ubuntu/yandex-cloud/bin/docker-credential-yc" ]; then
+              echo "Используем docker-credential-yc..."
+              cat > ~/.docker/config.json << EOF
+{
+  "auths": {},
+  "credHelpers": {
+    "cr.yandex": "yc"
+  },
+  "credsStore": "yc"
+}
+EOF
+              docker push ${IMAGE_FULL} || {
+                echo "❌ Ошибка после всех попыток"
+                exit 1
+              }
+            else
+              echo "❌ docker-credential-yc не найден"
+              exit 1
+            fi
+          fi
           
-          echo "Отправка: ${IMAGE_LATEST}"
-          docker push ${IMAGE_LATEST} || echo "Не удалось загрузить latest"
+          # Пушим latest
+          echo "Пушим latest..."
+          docker push ${IMAGE_LATEST} || echo "⚠️ Не удалось загрузить latest"
           
-          echo "Образы успешно загружены в YCR"
+          echo "✅ Образы загружены в YCR!"
         '''
       }
     }
 
-    stage('Kubernetes Deploy') {
+    stage('Deploy to K8S') {
       steps {
         sh '''
-          echo "==> Деплоймент в Kubernetes"
+          echo "=== ДЕПЛОЙ В K8S ==="
           echo "Используем образ: ${IMAGE_FULL}"
           
-          # Убедимся что в deployment.yaml есть IMAGE_PLACEHOLDER
+          # Проверяем deployment.yaml
           if ! grep -q "IMAGE_PLACEHOLDER" k8s/deployment.yaml; then
-            echo "В deployment.yaml нет IMAGE_PLACEHOLDER!"
-            echo "Исправь k8s/deployment.yaml:"
-            echo "  image: IMAGE_PLACEHOLDER"
+            echo "❌ В deployment.yaml нет IMAGE_PLACEHOLDER!"
+            echo "Содержимое deployment.yaml:"
+            head -20 k8s/deployment.yaml
             exit 1
           fi
           
-          # Создаем временный deployment файл с подставленным образом
-          sed "s|IMAGE_PLACEHOLDER|${IMAGE_FULL}|g" k8s/deployment.yaml > k8s/deployment-temp.yaml
+          # Удаляем старые поды
+          echo "Удаляем старые поды..."
+          kubectl delete pods -n ${NAMESPACE} -l app=${APP_NAME} --ignore-not-found=true
+          sleep 5
           
-          # Удаляем старый деплоймент
-          kubectl delete deployment ${APP_NAME} -n ${NAMESPACE} --ignore-not-found=true
-          sleep 3
+          # Обновляем deployment
+          echo "Обновляем deployment..."
+          sed -i "s|IMAGE_PLACEHOLDER|${IMAGE_FULL}|g" k8s/deployment.yaml
           
-          # Применяем манифесты
-          kubectl apply -f k8s/deployment-temp.yaml
+          # Применяем
+          kubectl apply -f k8s/deployment.yaml -n ${NAMESPACE}
           kubectl apply -f k8s/service.yaml -n ${NAMESPACE}
           
-          # Ждем rollout
+          # Ждем
           echo "Ожидаем развертывания..."
-          kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=180s || {
-            echo "Rollout status не завершился, проверяем вручную..."
-            sleep 10
-          }
+          sleep 15
           
-          # Показываем статус
-          echo "==> Финальное состояние"
+          echo "Статус:"
           kubectl get all -n ${NAMESPACE}
           
-          # Проверяем поды
-          echo "Статус подов:"
+          echo "Поды:"
           kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o wide
+          
+          # Проверяем ошибки
+          echo "Проверяем ошибки:"
+          kubectl describe pods -n ${NAMESPACE} -l app=${APP_NAME} | grep -A5 -B5 "Error\|Failed\|BackOff" || echo "Ошибок не найдено"
         '''
       }
     }
@@ -170,10 +237,7 @@ EOF
   post {
     always {
       sh '''
-        echo "==> Очистка"
-        rm -f k8s/deployment-temp.yaml 2>/dev/null || true
-        
-        echo "==> Итог"
+        echo "=== ФИНИШ ==="
         echo "Образ: ${IMAGE_FULL}"
         echo "Поды:"
         kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} 2>/dev/null || echo "Поды не найдены"
