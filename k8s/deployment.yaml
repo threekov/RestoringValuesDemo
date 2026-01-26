@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: knn-vm-lab7
-          image: cr.yandex/<REGISTRY_ID>/knn-vm-lab7:latest
+          image: IMAGE_PLACEHOLDER
           imagePullPolicy: Always
           ports:
             - name: http
